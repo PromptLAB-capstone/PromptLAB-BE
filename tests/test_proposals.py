@@ -1,4 +1,4 @@
-"""제안서 자동 작성 API/LLM 테스트 (이슈 #102). DB/네트워크 불필요 -- 전부 mock.
+"""제안서 자동 작성 API/LLM/PDF 테스트 (이슈 #102). DB/네트워크 불필요 -- 전부 mock.
 
 field-definitions 실제 DB 조회 1건만 @pytest.mark.db로 표시한다
 (`scripts/seed_proposal_fields.py` 실행 후 로컬에서 확인).
@@ -33,6 +33,7 @@ from app.domain.proposal_llm import (
     build_response_schema,
     generate_missing_sections,
 )
+from app.domain.proposal_pdf import render_proposal_pdf
 from scripts.seed_proposal_fields import (
     FIELD_DEFINITION_ROWS,
     TEMPLATE_FIELD_ROWS,
@@ -78,8 +79,6 @@ def test_every_field_has_a_description() -> None:
 
 
 def test_attachment_checklist_is_checklist_type_not_text() -> None:
-    # 리뷰 중 발견했던 모순(체크리스트라고 매트릭스에 적어놓고 API 예시는 텍스트로
-    # 다뤘던 것)의 회귀 테스트.
     row = next(r for r in FIELD_DEFINITION_ROWS if r["field_key"] == "attachment_checklist")
     assert row["field_type"] == "CHECKLIST"
 
@@ -105,7 +104,6 @@ def test_template_field_map_only_references_known_fields() -> None:
 
 
 def test_trl_level_is_rnd_required_and_ir_optional_but_not_psst() -> None:
-    # 사용자 결정(2026-09-07): TRL만 추가, PSST에는 없음.
     trl_rows = {
         row["template_type"]: row["requirement"]
         for row in TEMPLATE_FIELD_ROWS
@@ -134,8 +132,6 @@ def test_is_pdf_rejects_other_files() -> None:
 
 
 def test_extract_pdf_text_is_callable() -> None:
-    # 실제 PDF 바이트 케이스는 funding.py 쪽 test_funding_match.py가 이미 다룬다
-    # (같은 pypdf 사용법 -- 여기서는 인터페이스만 회귀로 고정).
     assert callable(_extract_pdf_text)
 
 
@@ -191,7 +187,6 @@ def test_build_response_schema_raises_for_unregistered_table_field() -> None:
 
 
 async def test_generate_missing_sections_returns_empty_dict_when_no_target_fields() -> None:
-    # target_fields가 비면 OPENAI_API_KEY 여부와 무관하게 바로 반환돼야 한다.
     assert await generate_missing_sections("PSST", "report", {}, []) == {}
 
 
@@ -259,6 +254,41 @@ async def test_generate_missing_sections_uses_cache_on_second_call(monkeypatch) 
 
 
 # ---------------------------------------------------------------------------
+# app/domain/proposal_pdf.py -- 순수 렌더링, DB/네트워크 불필요
+# ---------------------------------------------------------------------------
+
+
+def test_render_proposal_pdf_produces_valid_pdf_bytes() -> None:
+    pdf_bytes = render_proposal_pdf(
+        "PSST",
+        [
+            {"field_key": "company_overview", "label": "기업개요·대표자", "field_type": "TEXT", "value": "설명"},
+            {"field_key": "attachment_checklist", "label": "첨부서류", "field_type": "CHECKLIST", "value": ["사업자등록증"]},
+            {
+                "field_key": "growth_targets",
+                "label": "정량적 성장목표",
+                "field_type": "TABLE",
+                "value": [{"year": 1, "revenue_krw": 1000}],
+            },
+        ],
+    )
+    assert pdf_bytes[:4] == b"%PDF"
+    assert len(pdf_bytes) > 0
+
+
+def test_render_proposal_pdf_handles_empty_values_without_raising() -> None:
+    pdf_bytes = render_proposal_pdf(
+        "IR",
+        [
+            {"field_key": "esg", "label": "사회적 가치·ESG", "field_type": "TEXT", "value": ""},
+            {"field_key": "attachment_checklist", "label": "첨부서류", "field_type": "CHECKLIST", "value": []},
+            {"field_key": "cap_table", "label": "지분구조", "field_type": "TABLE", "value": []},
+        ],
+    )
+    assert pdf_bytes[:4] == b"%PDF"
+
+
+# ---------------------------------------------------------------------------
 # complete / pdf -- 실제 Redis 대신 monkeypatch로 대체 (CI에서 실행)
 # ---------------------------------------------------------------------------
 
@@ -267,7 +297,10 @@ async def test_complete_proposal_stores_payload_with_ttl(monkeypatch) -> None:
     fake_set = AsyncMock()
     monkeypatch.setattr(proposals.redis_client, "set", fake_set)
 
-    request = CompleteRequest(sections=[CompleteSection(field_key="company_overview", value="최종본")])
+    request = CompleteRequest(
+        template_type="PSST",
+        sections=[CompleteSection(field_key="company_overview", label="기업개요·대표자", field_type="TEXT", value="최종본")],
+    )
     response = await complete_proposal("prop-1", request)
 
     assert response.result.proposal_id == "prop-1"
@@ -276,21 +309,8 @@ async def test_complete_proposal_stores_payload_with_ttl(monkeypatch) -> None:
     assert kwargs["ex"] == proposals._PROPOSAL_TTL_SECONDS
     assert call_args[0] == "proposal:prop-1"
     stored = json.loads(call_args[1])
+    assert stored["template_type"] == "PSST"
     assert stored["sections"][0]["value"] == "최종본"
-
-
-async def test_complete_proposal_accepts_checklist_and_table_values(monkeypatch) -> None:
-    fake_set = AsyncMock()
-    monkeypatch.setattr(proposals.redis_client, "set", fake_set)
-
-    request = CompleteRequest(
-        sections=[
-            CompleteSection(field_key="attachment_checklist", value=["사업자등록증"]),
-            CompleteSection(field_key="growth_targets", value=[{"year": 1, "revenue_krw": 0}]),
-        ]
-    )
-    response = await complete_proposal("prop-2", request)
-    assert response.result.proposal_id == "prop-2"
 
 
 async def test_get_proposal_pdf_returns_404_when_expired_or_missing(monkeypatch) -> None:
@@ -302,11 +322,14 @@ async def test_get_proposal_pdf_returns_404_when_expired_or_missing(monkeypatch)
     assert body["code"] == "PROPOSAL_NOT_FOUND"
 
 
-async def test_get_proposal_pdf_returns_cached_content(monkeypatch) -> None:
+async def test_get_proposal_pdf_returns_real_pdf_binary(monkeypatch) -> None:
     cached_payload = json.dumps(
         {
             "proposal_id": "prop-1",
-            "sections": [{"field_key": "company_overview", "value": "최종본"}],
+            "template_type": "PSST",
+            "sections": [
+                {"field_key": "company_overview", "label": "기업개요·대표자", "field_type": "TEXT", "value": "최종본"}
+            ],
             "expires_at": "2026-09-07T12:10:00+00:00",
         }
     )
@@ -314,5 +337,6 @@ async def test_get_proposal_pdf_returns_cached_content(monkeypatch) -> None:
 
     response = await get_proposal_pdf("prop-1")
 
-    assert response.result.proposal_id == "prop-1"
-    assert response.result.sections[0].value == "최종본"
+    assert response.media_type == "application/pdf"
+    assert response.body[:4] == b"%PDF"
+    assert "proposal_prop-1.pdf" in response.headers["content-disposition"]

@@ -4,10 +4,6 @@ app/api/funding.py(PR #101)와 동일한 컨벤션을 따른다 -- UploadFile+Fo
 _error() 헬퍼, ApiResponse envelope. 검진 리포트 PDF를 텍스트로 추출하는 부분은 지금
 funding.py와 중복 구현이다 -- app/domain/pdf_utils.py 같은 공유 모듈 분리는 funding
 담당과 협의 후 별도 진행 (§6-3).
-
-⚠️ 실제 PDF 바이너리 생성(get_proposal_pdf)은 이번 작업 범위 밖이다 -- PDF 생성
-라이브러리(reportlab/weasyprint 등)가 requirements.txt에 없어 라이브러리 선택부터
-필요하다. 지금은 완료된 제안서 내용을 JSON으로 반환한다.
 """
 
 from __future__ import annotations
@@ -18,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Annotated
 
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, File, Form, Response, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pypdf import PdfReader
@@ -32,6 +28,7 @@ from app.domain.proposal_llm import (
     ProposalLLMUnavailable,
     generate_missing_sections,
 )
+from app.domain.proposal_pdf import render_proposal_pdf
 from app.schemas.common import ApiResponse
 
 router = APIRouter(prefix="/api/v1/proposals", tags=["proposals"])
@@ -291,10 +288,13 @@ async def generate_proposal(
 
 class CompleteSection(BaseModel):
     field_key: str
+    label: str
+    field_type: str
     value: SectionValue
 
 
 class CompleteRequest(BaseModel):
+    template_type: str  # render_proposal_pdf()가 문서 제목을 고르는 데 필요
     sections: list[CompleteSection]
 
 
@@ -317,10 +317,13 @@ async def complete_proposal(proposal_id: str, request: CompleteRequest) -> Compl
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=_PROPOSAL_TTL_SECONDS)
     payload = {
         "proposal_id": proposal_id,
+        "template_type": request.template_type,
         "sections": [section.model_dump() for section in request.sections],
         "expires_at": expires_at.isoformat(),
     }
-    await redis_client.set(_CACHE_KEY_PREFIX + proposal_id, json.dumps(payload, ensure_ascii=False), ex=_PROPOSAL_TTL_SECONDS)
+    await redis_client.set(
+        _CACHE_KEY_PREFIX + proposal_id, json.dumps(payload, ensure_ascii=False), ex=_PROPOSAL_TTL_SECONDS
+    )
 
     return CompleteResponse(
         isSuccess=True,
@@ -330,40 +333,27 @@ async def complete_proposal(proposal_id: str, request: CompleteRequest) -> Compl
     )
 
 
-class ProposalContentResult(BaseModel):
-    proposal_id: str
-    sections: list[CompleteSection]
-    expires_at: datetime
-
-
-class ProposalContentResponse(ApiResponse):
-    result: ProposalContentResult
-
-
 @router.get(
     "/{proposal_id}/pdf",
-    response_model=ProposalContentResponse,
-    responses={404: {"model": ProposalErrorResponse}},
+    response_model=None,  # Response(실제 PDF 바이너리)와 JSONResponse(에러)를 함께 반환 -- 둘 다 pydantic 필드가 아니라 응답모델 추론을 꺼야 한다
+    responses={
+        404: {"model": ProposalErrorResponse},
+        200: {"content": {"application/pdf": {}}},
+    },
 )
-async def get_proposal_pdf(proposal_id: str) -> ProposalContentResponse | JSONResponse:
-    """⚠️ 실제 PDF 바이너리 생성은 이번 작업 범위 밖이다 (§6-1 후속 논의 -- 동기 생성 vs
-    presigned URL 방식 미정, requirements.txt에 PDF 생성 라이브러리가 아직 없음). 지금은
-    완료된 제안서 내용을 JSON으로 반환한다 -- 프론트가 이 데이터로 화면 렌더링 후 브라우저
-    인쇄 등으로 임시 대응하거나, PDF 라이브러리 선택 후 이 엔드포인트를 실제 바이너리
-    응답으로 교체한다.
+async def get_proposal_pdf(proposal_id: str) -> Response | JSONResponse:
+    """10분 이내에만 다운로드 가능. `complete` 호출 전이면 404.
+
+    실제 PDF 바이너리(app/domain/proposal_pdf.py, 나눔고딕 임베딩)를 반환한다.
     """
     cached = await redis_client.get(_CACHE_KEY_PREFIX + proposal_id)
     if cached is None:
         return await _error(404, "PROPOSAL_NOT_FOUND", "제안서를 찾을 수 없거나 만료되었습니다.")
 
     payload = json.loads(cached)
-    return ProposalContentResponse(
-        isSuccess=True,
-        code="COMMON200",
-        message="성공",
-        result=ProposalContentResult(
-            proposal_id=payload["proposal_id"],
-            sections=[CompleteSection(**section) for section in payload["sections"]],
-            expires_at=payload["expires_at"],
-        ),
+    pdf_bytes = render_proposal_pdf(payload["template_type"], payload["sections"])
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="proposal_{proposal_id}.pdf"'},
     )
