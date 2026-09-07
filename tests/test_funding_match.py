@@ -3,6 +3,7 @@ from datetime import date
 from app.domain.funding_match import (
     FundingProgram,
     extract_funding_profile,
+    is_money_support_program,
     score_funding_program,
     sort_funding_matches,
 )
@@ -126,3 +127,54 @@ def test_sort_funding_matches_uses_score_deadline_then_amount() -> None:
 
     assert sorted_ids[0] == "third"
     assert sorted_ids[1:] == ["first", "second"]
+
+
+def test_money_support_filter_excludes_non_cash_support_categories() -> None:
+    program = FundingProgram(
+        program_id="mentoring",
+        title="하드웨어 제조 고민 1:1 무료 진단",
+        support_amount_text="멘토링ㆍ컨설팅ㆍ교육",
+        description="현직 전문가가 무료 멘토링을 제공합니다.",
+    )
+
+    assert not is_money_support_program(program)
+
+
+def test_money_support_filter_excludes_broad_business_mentoring_without_cash_terms() -> None:
+    program = FundingProgram(
+        program_id="business-mentoring",
+        title="AI 서비스 사업화 멘토링 프로그램",
+        support_amount_text="멘토링ㆍ컨설팅ㆍ교육",
+        description="사업화 전략 수립과 전문가 컨설팅을 지원합니다.",
+    )
+
+    assert not is_money_support_program(program)
+
+
+def test_money_support_filter_includes_business_and_rnd_funding() -> None:
+    business_program = FundingProgram(
+        program_id="business",
+        title="AI 헬스케어 사업화 지원사업",
+        support_amount_text="사업화",
+        description="서비스 개발비와 사업비를 지원합니다.",
+    )
+    rnd_program = FundingProgram(
+        program_id="rnd",
+        title="디지털헬스 기술개발 R&D 지원사업",
+        support_amount_text="기술개발(R&D)",
+        description="기술개발 자금을 지원합니다.",
+    )
+
+    assert is_money_support_program(business_program)
+    assert is_money_support_program(rnd_program)
+
+
+def test_money_support_filter_keeps_cash_program_even_if_category_is_broad() -> None:
+    program = FundingProgram(
+        program_id="broad",
+        title="창업기업 사업화 자금 지원",
+        support_amount_text="시설ㆍ공간ㆍ보육",
+        description="선정 기업에 사업비 최대 5천만원을 지원합니다.",
+    )
+
+    assert is_money_support_program(program)

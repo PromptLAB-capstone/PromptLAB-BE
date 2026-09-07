@@ -120,6 +120,42 @@ _KEYWORDS = [
     "진단",
 ]
 
+_FUNDING_INCLUDE_TERMS = [
+    "사업화",
+    "기술개발",
+    "R&D",
+    "정책자금",
+    "융자",
+    "보조금",
+    "지원금",
+    "사업비",
+    "개발비",
+    "창업자금",
+    "자금",
+    "투자연계",
+]
+
+_FUNDING_STRICT_INCLUDE_TERMS = [
+    "정책자금",
+    "융자",
+    "보조금",
+    "지원금",
+    "사업비",
+    "개발비",
+    "창업자금",
+    "자금지원",
+    "투자연계",
+]
+
+_FUNDING_EXCLUDE_CATEGORIES = [
+    "멘토링ㆍ컨설팅ㆍ교육",
+    "행사ㆍ네트워크",
+    "시설ㆍ공간ㆍ보육",
+    "창업교육",
+]
+
+_FUNDING_AMOUNT_PATTERN = re.compile(r"\d+\s*(억|천만|백만|만원|원)")
+
 
 @dataclass(frozen=True)
 class FundingProfile:
@@ -274,6 +310,23 @@ def sort_funding_matches(matches: list[FundingMatch]) -> list[FundingMatch]:
             item.program.title,
         ),
     )
+
+
+def is_money_support_program(program: FundingProgram) -> bool:
+    """지원금 추천 화면에 노출할 자금성 지원사업인지 판정한다."""
+
+    support_text = program.support_amount_text or ""
+    support_compact = compact_text(support_text)
+    searchable_text = _program_searchable_text(program)
+    searchable_compact = compact_text(searchable_text)
+
+    if any(compact_text(term) in support_compact for term in _FUNDING_EXCLUDE_CATEGORIES):
+        return (
+            any(compact_text(term) in searchable_compact for term in _FUNDING_STRICT_INCLUDE_TERMS)
+            or bool(_FUNDING_AMOUNT_PATTERN.search(searchable_text))
+            or program.max_amount is not None
+        )
+    return any(compact_text(term) in searchable_compact for term in _FUNDING_INCLUDE_TERMS)
 
 
 def profile_to_dict(profile: FundingProfile) -> dict[str, Any]:

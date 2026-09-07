@@ -13,6 +13,7 @@ from pypdf import PdfReader
 from app.domain.funding_match import (
     FundingProgram,
     extract_funding_profile,
+    is_money_support_program,
     profile_to_dict,
     score_funding_program,
     sort_funding_matches,
@@ -106,7 +107,11 @@ async def recommend_funding_programs(
     today = recommended_at.date()
 
     rows, source_warnings = await fetch_external_funding_programs(profile)
-    active_rows = [row for row in rows if row.deadline is None or row.deadline >= today]
+    active_rows = [
+        row
+        for row in rows
+        if (row.deadline is None or row.deadline >= today) and is_money_support_program(row)
+    ]
 
     matches = sort_funding_matches(
         [
