@@ -182,7 +182,8 @@ def extract_funding_profile(
     함께 사용한다. 별도 AI 모델 없이 카탈로그 값/키워드 기반으로만 매칭한다.
     """
 
-    compact = compact_text(report_text)
+    profile_text = _profile_scope_text(report_text)
+    compact = compact_text(profile_text)
     service_name = _extract_service_name(report_text)
     category_1 = _find_first(_CATEGORY_1, compact)
     category_2 = _find_first(_CATEGORY_2, compact)
@@ -288,11 +289,36 @@ def profile_to_dict(profile: FundingProfile) -> dict[str, Any]:
     }
 
 
+def _profile_scope_text(text: str) -> str:
+    markers = [
+        compact_text("규제 위험도"),
+        compact_text("서비스 분류"),
+        compact_text("데이터 확보"),
+        compact_text("시장 현실성"),
+    ]
+    scoped_lines: list[str] = []
+    collect_intro = True
+    for line in text.splitlines():
+        line_compact = compact_text(line)
+        if line_compact and len(line_compact) <= 20 and any(line_compact.startswith(marker) for marker in markers):
+            break
+        if line_compact.startswith("#"):
+            scoped_lines.append(line)
+            continue
+        if line_compact.startswith(("현재서비스는", "gatepass", "gatefail", "종합신호등")):
+            collect_intro = False
+        if collect_intro:
+            scoped_lines.append(line)
+    return "\n".join(scoped_lines) or text
+
+
 def _extract_service_name(text: str) -> str | None:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     skip_tokens = ["PREP", "Startup Preparation", "Evaluation", "리포트", "목차"]
     for line in lines[:20]:
         clean = re.sub(r"\s+", "", line)
+        if clean in {"다.", "니다."} or clean.endswith("보관됩니다."):
+            continue
         if 1 < len(clean) <= 30 and not any(token.lower() in clean.lower() for token in skip_tokens):
             if re.search(r"[가-힣A-Za-z]", clean):
                 return clean

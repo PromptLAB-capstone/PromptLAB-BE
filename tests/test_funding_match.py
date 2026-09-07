@@ -27,6 +27,42 @@ def test_extract_funding_profile_handles_spaced_korean_pdf_text() -> None:
     assert "AI" in profile.keywords
 
 
+def test_extract_funding_profile_ignores_later_legal_examples() -> None:
+    text = """
+    슬 립
+    수면 패턴을 분석해서 맞춤형 수면 루틴을 추천하는 모바일 앱을 만들고 싶어요.
+    # 수면 # 데 이 터 기 록 관 리 # 수면 관심층 # 모바일 앱
+    규 제 위 험 도
+    의료기기와 개인용 건강관리 제품 판단 사례
+    당뇨병 환자의 혈당을 스마트폰으로 측정하는 사례
+    """
+
+    profile = extract_funding_profile(text)
+
+    assert profile.category_1 == "수면"
+    assert "수면" in profile.keywords
+    assert "혈당" not in profile.keywords
+    assert "당뇨" not in profile.keywords
+
+
+def test_extract_funding_profile_uses_idea_and_hashtag_not_generated_summary() -> None:
+    text = """
+    슬 립
+    수면 패턴을 분석해서 맞춤형 수면 루틴을 추천하는 모바일 앱입니다.
+    현재 서비스는 개선 여지가 있습니다.
+    GATE PASS · 비의료기기
+    서비스 '슬립'은 의학적 정의에 따른 규제 위험도가 낮습니다.
+    # 수면 # 데이터 기록관리 # 수면 관심층 # 모바일 앱
+    규제 위험도
+    """
+
+    profile = extract_funding_profile(text)
+
+    assert profile.category_2 == "데이터 기록관리"
+    assert "의료" not in profile.keywords
+    assert "수면 관심층" in profile.targets
+
+
 def test_score_funding_program_uses_keywords_region_stage_and_deadline() -> None:
     profile = extract_funding_profile(
         "수면 데이터를 기록 분석하는 모바일 앱 # 수면 # 데이터 기록관리 # 모바일 앱",
