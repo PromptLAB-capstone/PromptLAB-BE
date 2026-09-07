@@ -4,18 +4,21 @@
 > `판정_API_명세서.md`/`시장성_BM_API_명세서.md`와 같은 포맷.
 > DB 저장 없음(`db_구축_설계서.md` §1.3 "사용자 입력·분석결과 미저장" 원칙) — Redis TTL 캐시만 사용. `미결정_항목_정리.md` #1(E-4) "리포트 재조회·창업제안서 연계 방식 미정"을 본 문서로 확정한다.
 >
-> ⚠️ **리뷰 중 발견 (2026-09-07)**: `app/db/models/analysis_session.py`를 확인한 결과 `analysis_sessions`는 실제로 **Postgres에 영구 저장**되며, 삭제/TTL 로직이 코드에 없다(`analysis_sessions.py` API에 `DELETE` 엔드포인트 없음, cron/스케줄러 없음). 즉 §10.4 "사용자 입력·분석결과 미저장" 원칙이 검진 세션 자체에는 아직 구현돼 있지 않다 — 지금은 `session_id`만 있으면 검진 데이터가 계속 조회된다. 본 문서 §0/§5.2는 이 현재 상태를 전제로 작성했다. 검진 담당이 나중에 `analysis_sessions`에 실제 TTL 삭제를 붙이면, 아래 "검진 결과 직접 참조" 방식도 그 TTL 안에서만 유효해지므로 함께 조정 필요(§6-3 참고).
+> ⚠️ **리뷰 중 발견 1 (2026-09-07)**: `app/db/models/analysis_session.py`를 확인한 결과 `analysis_sessions`는 실제로 **Postgres에 영구 저장**되며, 삭제/TTL 로직이 코드에 없다. §10.4 원칙이 검진 세션 자체에는 아직 구현돼 있지 않다.
+>
+> ⚠️ **리뷰 중 발견 2 (2026-09-07, main 병합 후)**: 위 발견 1을 근거로 처음엔 "PDF 재업로드 대신 `session_id` 직접 참조"로 단순화했었는데, 본 PR 작업 중 **`feat/funding-pdf-recommendations`(PR #101)가 먼저 main에 병합**돼 같은 문제(검진 리포트 → 후속 기능)를 이미 **"리포트 PDF 업로드 + 텍스트 추출"** 방식으로 풀어놓은 걸 발견했다(`app/api/funding.py`, `app/domain/funding_match.py`). `session_id` 참조 방식으로 가면 이 기존 컨벤션과 갈라지고, `analysis_sessions`에 나중에 실제 TTL이 붙으면 참조 자체가 깨진다. **PDF 업로드 방식으로 되돌리고, funding.py 컨벤션을 그대로 따른다.**
 
 ## 0. 전체 흐름
 
 ```
-[아이디어 검진] 진행 → 검진 결과는 analysis_sessions(session_id)에 이미 저장돼 있음
+[아이디어 검진] 진행 → 결과 리포트 PDF 다운로드
         │
         ▼
-[제안서 자동 작성] 탭에서 session_id 참조 + 지원사업 유형 선택
+[제안서 자동 작성] 탭에서 리포트 PDF 업로드 + 지원사업 유형 선택
         │
         ▼
-POST /proposals/generate  ── LLM이 유형별 필드 매트릭스 기준 초안 생성
+POST /proposals/generate (multipart/form-data)
+  ── PDF 텍스트 추출(funding.py와 동일 방식) + LLM이 유형별 필드 매트릭스 기준 초안 생성
         │
         ▼ (사용자가 화면에서 초안 검토/수정)
         │
@@ -30,7 +33,7 @@ GET /proposals/{id}/pdf  ── 10분 이내에만 다운로드 가능, 이후 �
 
 - 작성 중(완료 전) 상태는 **프론트 로컬 state로만 유지**한다. "임시저장" API는 없음.
 - "완료"와 "PDF 저장하기"는 **동일한 트리거**로 취급한다 — 둘 중 어느 쪽을 먼저 눌러도 그 시점부터 10분 TTL이 시작된다. (프론트 확인 완료, 2026-09-07)
-- 검진 결과는 **PDF 재업로드가 아니라 `session_id` 참조**로 가져온다 — `analysis_sessions`에 이미 구조화 저장돼 있어(위 발견 참고) PDF를 다시 파싱할 필요가 없다. 기존 "PDF 다운로드→재업로드" 아이디어는 이 발견 이후 폐기(§6-3).
+- 검진 결과는 **리포트 PDF 업로드**로 받는다 — `session_id` 참조가 아니라 `app/api/funding.py`(PR #101)와 동일한 "PDF 업로드 → 텍스트 추출" 패턴을 따른다. `analysis_sessions`에 나중에 TTL이 붙어도 영향받지 않는 구조.
 - 제안서 자체는 검진 결과와 동일한 캐시 클라이언트/패턴 재사용: `app/core/redis_client.py`, `ex=` TTL 방식 (`trend_client.py`, `correction_llm.py` 참조).
 
 ## 1. 지원사업 유형 (template_type)
@@ -121,7 +124,7 @@ GET /proposals/{id}/pdf  ── 10분 이내에만 다운로드 가능, 이후 �
 
 ## 3. DB 스키마 (신규, 고정 참조 데이터 — `data_difficulty`/`collection_difficulty`와 동일한 "고정 기준표" 패턴)
 
-리뷰 중 1차 초안의 `psst_requirement`/`rnd_requirement`/`ir_requirement` 3-컬럼 설계를 **폐기**했다 — 새 지원사업 유형이 추가될 때마다 컬럼을 늘려야 해서(ALTER TABLE) 교수님 피드백("표준 양식 하나로 고정하지 말고 확장 가능하게")과 정면으로 배치된다. `gate_matrix`처럼 **행 단위**로 바꿔 새 유형 추가 시 INSERT만으로 끝나게 한다.
+1차 초안의 `psst_requirement`/`rnd_requirement`/`ir_requirement` 3-컬럼 설계를 **폐기**했다 — 새 지원사업 유형이 추가될 때마다 컬럼을 늘려야 해서(ALTER TABLE) 교수님 피드백("표준 양식 하나로 고정하지 말고 확장 가능하게")과 정면으로 배치된다. `gate_matrix`처럼 **행 단위**로 바꿔 새 유형 추가 시 INSERT만으로 끝나게 한다.
 
 ### 3.1 `proposal_field_definitions` — 필드 자체의 정적 정보 (필드당 1행)
 
@@ -170,27 +173,27 @@ Authorization: Bearer `<accessToken>`
 }
 ```
 
-### 5.2 `POST /api/v1/proposals/generate`
+### 5.2 `POST /api/v1/proposals/generate` (multipart/form-data)
 
-검진 세션(`session_id`, `analysis_sessions` 참조) + 선택 유형 + 사용자가 채운 필드값을 받아 LLM이 제안서 초안을 생성한다. 이 시점에는 아직 완료 전이므로 **응답은 캐시에 저장하지 않는다** — 재요청 시 매번 새로 생성.
+`app/api/funding.py`(`/api/v1/funding/recommendations`)와 **동일한 요청 스타일**을 따른다 — 리포트 PDF는 `UploadFile`, 나머지는 `Form` 필드.
 
-```json
-// 요청
-{
-  "session_id": "string",             // analysis_sessions.session_id — 검진 결과 직접 참조
-  "template_type": "PSST",
-  "field_values": {
-    "company_overview": "string",
-    "attachment_checklist": ["사업자등록증", "재무제표"],
-    "overseas_expansion": "string"
-  }
-}
-```
+| 파트 | 타입 | 설명 |
+|---|---|---|
+| `report` | File (PDF) | 검진 결과 리포트 PDF. 10MB 제한(`_MAX_REPORT_BYTES`, funding.py와 동일 기준) |
+| `template_type` | Form | `PSST` / `RND` / `IR` |
+| `field_values` | Form (JSON 문자열) | 사용자가 화면에서 채운 필드값. `{"company_overview": "...", "attachment_checklist": ["사업자등록증"], ...}` |
+
+리포트 PDF 텍스트 추출은 funding.py의 `_extract_pdf_text`/`_is_pdf`를 그대로 재사용하거나(가능하면 `app/domain/pdf_utils.py` 등 공유 모듈로 뽑아서 두 기능이 함께 쓰는 것을 권장 — §6-3 참고), 최소한 같은 에러 코드 네이밍(`PROPOSAL_REPORT_PDF_REQUIRED`/`PROPOSAL_REPORT_TOO_LARGE`)을 맞춘다.
 
 `field_values`의 값 타입은 §3.1 `field_type`을 따른다 — `TEXT`는 문자열, `CHECKLIST`는 문자열 배열, `TABLE`은 `[{"year": 1, "revenue": 0, "headcount": 0}, ...]` 형태의 배열.
 
 ```json
-// 응답
+// 에러 응답 예시 (400 / 413, funding.py와 동일 패턴)
+{ "isSuccess": false, "code": "PROPOSAL_REPORT_PDF_REQUIRED", "message": "PDF 파일만 업로드할 수 있습니다.", "result": null }
+```
+
+```json
+// 성공 응답
 {
   "isSuccess": true,
   "code": "COMMON200",
@@ -204,6 +207,8 @@ Authorization: Bearer `<accessToken>`
   }
 }
 ```
+
+이 시점(완료 전)에는 캐시에 저장하지 않는다 — 재요청 시 매번 새로 생성.
 
 ### 5.3 `POST /api/v1/proposals/{proposal_id}/complete`
 
@@ -244,4 +249,5 @@ Authorization: Bearer `<accessToken>`
 |---|---|
 | 1 | PDF 생성을 동기(요청-응답)로 할지, presigned URL 발급 방식으로 할지 |
 | 2 | `generate` 응답 이후 사용자가 재생성을 요청할 수 있는 횟수 제한 여부 |
-| 3 | **(리뷰 중 갱신)** `session_id` 직접 참조가 지금은 기술적으로 가능하지만(analysis_sessions가 영구 저장 중), 검진 담당이 §10.4 원칙대로 TTL 삭제를 나중에 붙이면 "검진 후 며칠 뒤에 제안서 작성" 같은 흐름은 막힌다. 검진 세션 TTL을 도입할 계획이 있는지, 있다면 몇 분/시간으로 할지 검진 담당과 맞춰야 한다 |
+| 3 | **(리뷰 중 갱신)** PDF 텍스트 추출(`_extract_pdf_text`/`_is_pdf`, PDF 검증·크기 제한)을 `funding.py`와 이 기능이 각각 구현할지, `app/domain/pdf_utils.py` 같은 공유 모듈로 뽑을지 — funding 담당과 협의 필요 |
+| 4 | **(신규)** `extract_funding_profile`(funding_match.py)이 리포트에서 이미 `category_1`/`category_2`/`service_type`/`target`/`region`/`stage`를 추출하고 있음 — 이 결과를 제안서 `field_values`의 일부(예: `target_market_analysis`, `company_overview`) 초기값으로 재사용해 사용자 입력 부담을 줄일 수 있는지 검토 |
