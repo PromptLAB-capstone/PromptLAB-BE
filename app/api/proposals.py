@@ -5,9 +5,9 @@ _error() 헬퍼, ApiResponse envelope. 검진 리포트 PDF를 텍스트로 추�
 funding.py와 중복 구현이다 -- app/domain/pdf_utils.py 같은 공유 모듈 분리는 funding
 담당과 협의 후 별도 진행 (§6-3).
 
-⚠️ 이번 작업 범위: DB 스키마 + 엔드포인트 뼈대(요청/응답 계약, Redis TTL 캐시 정책)까지다.
-LLM 프롬프트 설계(_generate_section_text의 실제 생성 로직)와 PDF 바이너리 생성
-(get_proposal_pdf, 현재는 JSON 반환)은 후속 작업으로 명시적으로 남겨둔다.
+⚠️ 실제 PDF 바이너리 생성(get_proposal_pdf)은 이번 작업 범위 밖이다 -- PDF 생성
+라이브러리(reportlab/weasyprint 등)가 requirements.txt에 없어 라이브러리 선택부터
+필요하다. 지금은 완료된 제안서 내용을 JSON으로 반환한다.
 """
 
 from __future__ import annotations
@@ -27,6 +27,11 @@ from sqlalchemy import select
 from app.core.redis_client import redis_client
 from app.db.models import ProposalFieldDefinition, ProposalTemplateFieldMap
 from app.db.session import AsyncSessionLocal
+from app.domain.proposal_llm import (
+    ATTACHMENT_CHECKLISTS,
+    ProposalLLMUnavailable,
+    generate_missing_sections,
+)
 from app.schemas.common import ApiResponse
 
 router = APIRouter(prefix="/api/v1/proposals", tags=["proposals"])
@@ -35,6 +40,10 @@ _MAX_REPORT_BYTES = 10 * 1024 * 1024
 _PROPOSAL_TTL_SECONDS = 600
 _CACHE_KEY_PREFIX = "proposal:"
 TEMPLATE_TYPES = frozenset({"PSST", "RND", "IR"})
+
+# ProposalSection/CompleteSection이 공통으로 쓰는 값 타입 -- field_type에 따라 셋 중 하나.
+# TEXT -> str, CHECKLIST -> list[str], TABLE -> list[dict]
+SectionValue = str | list[str] | list[dict]
 
 
 class ProposalErrorResponse(ApiResponse):
@@ -68,6 +77,7 @@ class FieldDefinitionItem(BaseModel):
     field_key: str
     category: str
     label: str
+    description: str | None
     field_type: str
     requirement: str
     display_order: int
@@ -90,6 +100,7 @@ async def _fetch_field_definitions(template_type: str) -> list[FieldDefinitionIt
                     ProposalFieldDefinition.field_key,
                     ProposalFieldDefinition.category,
                     ProposalFieldDefinition.label,
+                    ProposalFieldDefinition.description,
                     ProposalFieldDefinition.field_type,
                     ProposalFieldDefinition.display_order,
                     ProposalTemplateFieldMap.requirement,
@@ -108,6 +119,7 @@ async def _fetch_field_definitions(template_type: str) -> list[FieldDefinitionIt
             field_key=row.field_key,
             category=row.category,
             label=row.label,
+            description=row.description,
             field_type=row.field_type,
             requirement=row.requirement,
             display_order=row.display_order,
@@ -146,12 +158,16 @@ async def get_field_definitions(template_type: str) -> FieldDefinitionsResponse 
 class ProposalSection(BaseModel):
     field_key: str
     label: str
-    generated_text: str
+    field_type: str
+    value: SectionValue
 
 
 class GenerateResult(BaseModel):
     proposal_id: str
     template_type: str
+    # "ok" | "unavailable" -- LLM 호출 실패 시에도 요청 전체를 502로 죽이지 않고
+    # (§10.1 원칙) 자리표시자로 채운 뒤 이 값으로 프론트에 알린다.
+    llm_status: str
     sections: list[ProposalSection]
 
 
@@ -159,19 +175,10 @@ class GenerateResponse(ApiResponse):
     result: GenerateResult
 
 
-def _generate_section_text(field_key: str, report_text: str, field_values: dict) -> str:
-    """LLM 프롬프트 설계는 이번 작업 범위 밖이다 (팀 결정, 2026-09-07).
-
-    지금은 사용자가 화면에서 입력한 값이 있으면 그대로 통과시키고, 없으면 자리표시자를
-    반환한다 -- generate 엔드포인트의 요청/응답 계약과 "완료 전엔 캐시하지 않는다"는
-    정책을 먼저 굳히기 위한 스텁이다. report_text는 다음 단계(프롬프트 설계)에서
-    실제로 사용된다.
-    """
-    del report_text  # 다음 단계(LLM 프롬프트 설계)에서 사용 예정
-    user_value = field_values.get(field_key)
-    if isinstance(user_value, str) and user_value.strip():
-        return user_value
-    return f"[TODO: LLM 초안 생성 예정 -- {field_key}]"
+def _placeholder_value(field_type: str, label: str) -> SectionValue:
+    if field_type == "TABLE":
+        return []
+    return f"[자동 생성 실패 -- 직접 입력해주세요: {label}]"
 
 
 @router.post(
@@ -209,21 +216,71 @@ async def generate_proposal(
     report_text = _extract_pdf_text(content)
     fields = await _fetch_field_definitions(template_type)
 
-    sections = [
-        ProposalSection(
-            field_key=field.field_key,
-            label=field.label,
-            generated_text=_generate_section_text(field.field_key, report_text, values),
+    sections: list[ProposalSection] = []
+    llm_target_fields: list[dict] = []  # generate_missing_sections()에 넘길 스펙만 추림
+
+    for field in fields:
+        user_value = values.get(field.field_key)
+        if isinstance(user_value, (str, list)) and user_value:
+            sections.append(
+                ProposalSection(
+                    field_key=field.field_key, label=field.label, field_type=field.field_type, value=user_value
+                )
+            )
+            continue
+
+        if field.field_type == "CHECKLIST":
+            sections.append(
+                ProposalSection(
+                    field_key=field.field_key,
+                    label=field.label,
+                    field_type=field.field_type,
+                    value=ATTACHMENT_CHECKLISTS.get(template_type, []),
+                )
+            )
+            continue
+
+        llm_target_fields.append(
+            {
+                "field_key": field.field_key,
+                "label": field.label,
+                "field_type": field.field_type,
+                "description": field.description,
+            }
         )
-        for field in fields
-    ]
+
+    llm_status = "ok"
+    generated: dict = {}
+    if llm_target_fields:
+        try:
+            generated = await generate_missing_sections(template_type, report_text, values, llm_target_fields)
+        except ProposalLLMUnavailable:
+            llm_status = "unavailable"
+
+    for field_spec in llm_target_fields:
+        key = field_spec["field_key"]
+        if key in generated:
+            value: SectionValue = generated[key]
+        else:
+            value = _placeholder_value(field_spec["field_type"], field_spec["label"])
+        sections.append(
+            ProposalSection(
+                field_key=key, label=field_spec["label"], field_type=field_spec["field_type"], value=value
+            )
+        )
+
+    order = {field.field_key: field.display_order for field in fields}
+    sections.sort(key=lambda section: order.get(section.field_key, 0))
 
     # 완료(POST /{id}/complete) 전까지는 캐시하지 않는다 (§0, §5.2) -- 재요청 시 매번 새로 생성.
+    # (generate_missing_sections() 내부의 짧은 캐시는 "완료 전 재시도 비용 절감"용으로 별개다.)
     return GenerateResponse(
         isSuccess=True,
         code="COMMON200",
         message="성공",
-        result=GenerateResult(proposal_id=str(uuid.uuid4()), template_type=template_type, sections=sections),
+        result=GenerateResult(
+            proposal_id=str(uuid.uuid4()), template_type=template_type, llm_status=llm_status, sections=sections
+        ),
     )
 
 
@@ -234,7 +291,7 @@ async def generate_proposal(
 
 class CompleteSection(BaseModel):
     field_key: str
-    final_text: str
+    value: SectionValue
 
 
 class CompleteRequest(BaseModel):
@@ -263,7 +320,7 @@ async def complete_proposal(proposal_id: str, request: CompleteRequest) -> Compl
         "sections": [section.model_dump() for section in request.sections],
         "expires_at": expires_at.isoformat(),
     }
-    await redis_client.set(_CACHE_KEY_PREFIX + proposal_id, json.dumps(payload), ex=_PROPOSAL_TTL_SECONDS)
+    await redis_client.set(_CACHE_KEY_PREFIX + proposal_id, json.dumps(payload, ensure_ascii=False), ex=_PROPOSAL_TTL_SECONDS)
 
     return CompleteResponse(
         isSuccess=True,
@@ -290,10 +347,10 @@ class ProposalContentResponse(ApiResponse):
 )
 async def get_proposal_pdf(proposal_id: str) -> ProposalContentResponse | JSONResponse:
     """⚠️ 실제 PDF 바이너리 생성은 이번 작업 범위 밖이다 (§6-1 후속 논의 -- 동기 생성 vs
-    presigned URL 방식 미정, requirements.txt에 PDF 생성 라이브러리(reportlab/weasyprint
-    등)가 아직 없어 라이브러리 선택부터 필요). 지금은 완료된 제안서 내용을 JSON으로
-    반환한다 -- 프론트가 이 데이터로 화면 렌더링 후 브라우저 인쇄 등으로 임시 대응하거나,
-    PDF 라이브러리 선택 후 이 엔드포인트를 실제 바이너리 응답으로 교체한다.
+    presigned URL 방식 미정, requirements.txt에 PDF 생성 라이브러리가 아직 없음). 지금은
+    완료된 제안서 내용을 JSON으로 반환한다 -- 프론트가 이 데이터로 화면 렌더링 후 브라우저
+    인쇄 등으로 임시 대응하거나, PDF 라이브러리 선택 후 이 엔드포인트를 실제 바이너리
+    응답으로 교체한다.
     """
     cached = await redis_client.get(_CACHE_KEY_PREFIX + proposal_id)
     if cached is None:

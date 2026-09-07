@@ -1,0 +1,236 @@
+"""제안서 자동 작성 LLM 생성 (이슈 #102, docs/제안서_자동작성_API_명세서.md).
+
+app/domain/correction_llm.py와 동일한 컨벤션(AsyncOpenAI, temperature=0 고정 출력,
+json_schema strict 모드, Redis 캐싱, XxxUnavailable 예외)을 따른다.
+
+**필드 하나당 호출 하나가 아니라, 유형(template_type) 하나당 호출 하나로 묶는다** --
+app/pipeline/nodes/extract_b.py가 "LLM은 표에서 조회만" 원칙으로 호출 수를 줄이는 것과
+같은 이유로, 33개 필드를 각각 부르면 비용/지연이 33배가 된다. 사용자가 이미 값을 채운
+필드와 CHECKLIST 타입 필드(attachment_checklist -- 유형별 고정 목록, LLM 미사용)는
+애초에 target_fields로 넘어오지 않는다(app/api/proposals.py가 걸러서 넘김).
+
+§10.1 원칙("LLM 장애로 핵심 응답이 깨지면 안 된다")에 따라, 이 모듈이 실패해도
+app/api/proposals.py는 요청 전체를 502로 죽이지 않고 자리표시자로 대체한다. 다만
+report_llm.py의 보조 필드(LLM④⑤)와 달리 여기는 생성 결과 자체가 핵심 응답이므로,
+실패를 조용히 숨기지 않고 GenerateResult.llm_status로 프론트에 알린다.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+
+import openai
+from openai import AsyncOpenAI
+
+from app.core.config import settings
+from app.core.redis_client import redis_client
+
+_REQUEST_TIMEOUT_SECONDS = 30.0  # 여러 필드를 한 번에 생성하므로 correction_llm.py(15초)보다 여유를 둠
+_CACHE_TTL_SECONDS = 600  # 완료(§0) 전 재생성 재시도 비용 절감용 -- 제안서 자체의 10분 TTL과는 별개 목적
+_CACHE_KEY_PREFIX = "proposal_generation:"
+
+# TABLE 필드별 항목 스키마 -- docs/제안서_자동작성_API_명세서.md §2의 표 구조를 그대로 반영.
+# 새 TABLE 필드가 추가되면 여기에도 항목 스키마를 등록해야 한다(build_response_schema가 조회).
+TABLE_ITEM_SCHEMAS: dict[str, dict] = {
+    "growth_targets": {
+        "type": "object",
+        "properties": {
+            "year": {"type": "integer", "description": "사업 시작 후 n년차(1~3)"},
+            "revenue_krw": {"type": "integer", "description": "해당 연도 매출 목표(원)"},
+            "headcount": {"type": "integer", "description": "해당 연도 고용 목표(명)"},
+            "basis": {"type": "string", "description": "추정 근거 한 줄"},
+        },
+        "required": ["year", "revenue_krw", "headcount", "basis"],
+        "additionalProperties": False,
+    },
+    "annual_budget_exec": {
+        "type": "object",
+        "properties": {
+            "year": {"type": "integer"},
+            "government_fund_krw": {"type": "integer", "description": "정부출연금(원)"},
+            "self_fund_cash_krw": {"type": "integer", "description": "자기부담금 현금(원)"},
+            "self_fund_in_kind_krw": {"type": "integer", "description": "자기부담금 현물(원)"},
+        },
+        "required": ["year", "government_fund_krw", "self_fund_cash_krw", "self_fund_in_kind_krw"],
+        "additionalProperties": False,
+    },
+    "financial_projection": {
+        "type": "object",
+        "properties": {
+            "year": {"type": "integer"},
+            "revenue_krw": {"type": "integer"},
+            "cost_krw": {"type": "integer"},
+            "operating_profit_krw": {"type": "integer"},
+        },
+        "required": ["year", "revenue_krw", "cost_krw", "operating_profit_krw"],
+        "additionalProperties": False,
+    },
+    "cap_table": {
+        "type": "object",
+        "properties": {
+            "shareholder": {"type": "string", "description": "주주 구분(대표자/공동창업자/투자자 등)"},
+            "equity_percent": {"type": "number", "description": "지분율(%)"},
+        },
+        "required": ["shareholder", "equity_percent"],
+        "additionalProperties": False,
+    },
+}
+
+# attachment_checklist(CHECKLIST 타입)는 LLM을 쓰지 않는다 -- 유형별 고정 서류 목록.
+# ⚠️ 실제 공고문마다 요구 서류가 조금씩 다르다. 통상적으로 공통 요구되는 항목 기준의
+# 초안이며, 배포 전 실제 공고문으로 재대조가 필요하다(이슈 #102 §6 후속 논의로 등록).
+ATTACHMENT_CHECKLISTS: dict[str, list[str]] = {
+    "PSST": ["사업자등록증(또는 사업자등록 예정 확인서)", "대표자 신분증 사본", "개인정보 수집·이용 동의서"],
+    "RND": ["사업자등록증", "연구책임자 이력서", "참여연구원 확인서", "최근 결산 재무제표"],
+    "IR": ["사업자등록증", "최근 결산 재무제표", "정관", "주주명부(캡테이블)"],
+}
+
+_TEMPLATE_LABELS = {
+    "PSST": "창업사업화 지원사업 (PSST 표준형)",
+    "RND": "R&D 과제형 (기술개발사업)",
+    "IR": "투자유치용 (IR)",
+}
+
+_SYSTEM_PROMPT_TEMPLATE = """당신은 대한민국 정부 창업지원사업 사업계획서 작성을 돕는
+전문 컨설턴트입니다. 지금 작성하는 문서는 "{template_label}" 유형입니다.
+
+## 규칙
+- 사업계획서 심사위원이 읽는 공식 문서체로, 과장 없이 정량적 근거를 포함해 작성합니다.
+- "치료", "진단", "처방" 등 의료행위로 오인될 수 있는 표현은 쓰지 않습니다 -- PREP
+  GATE 판정 기준과 상충하면 이 서비스의 지원 자격 자체가 위험해집니다.
+- [검진 리포트]와 [사용자가 이미 입력한 내용]에 없는 사실(구체 수치·고유명사)을
+  지어내지 않습니다. 근거가 부족하면 일반적인 서술로 대체하세요.
+- 요청받은 필드만 채우세요. 요청하지 않은 필드는 만들지 마세요.
+"""
+
+
+class ProposalLLMUnavailable(Exception):
+    """OPENAI_API_KEY 미설정 또는 호출 실패(레이트리밋·타임아웃·malformed 응답 포함) 시."""
+
+
+def _build_client() -> AsyncOpenAI:
+    if not settings.openai_api_key:
+        raise ProposalLLMUnavailable("OPENAI_API_KEY가 설정되지 않았습니다.")
+    return AsyncOpenAI(api_key=settings.openai_api_key, timeout=_REQUEST_TIMEOUT_SECONDS)
+
+
+def build_response_schema(target_fields: list[dict]) -> dict:
+    """target_fields: [{"field_key", "label", "field_type", ...}, ...] (CHECKLIST 제외).
+
+    TABLE 필드는 TABLE_ITEM_SCHEMAS에 항목 스키마가 등록돼 있어야 한다 -- 없으면
+    시딩 데이터와 이 모듈의 스키마 목록이 어긋난 것이므로 조용히 넘기지 않고 바로 에러.
+    """
+    properties: dict = {}
+    for field in target_fields:
+        if field["field_type"] == "TABLE":
+            item_schema = TABLE_ITEM_SCHEMAS.get(field["field_key"])
+            if item_schema is None:
+                raise ValueError(f"TABLE_ITEM_SCHEMAS에 {field['field_key']} 항목 스키마가 없습니다.")
+            properties[field["field_key"]] = {"type": "array", "items": item_schema}
+        else:
+            properties[field["field_key"]] = {"type": "string"}
+
+    return {
+        "name": "proposal_sections",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": properties,
+            "required": [field["field_key"] for field in target_fields],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _build_user_prompt(report_text: str, field_values: dict, target_fields: list[dict]) -> str:
+    guide_lines = "\n".join(
+        f"- {field['field_key']} ({field['label']}): {field.get('description') or '작성 가이드 없음'}"
+        for field in target_fields
+    )
+    filled_lines = (
+        "\n".join(
+            f"- {key}: {value}"
+            for key, value in field_values.items()
+            if isinstance(value, str) and value.strip()
+        )
+        or "(없음)"
+    )
+
+    return f"""[작성해야 할 항목]
+{guide_lines}
+
+[검진 리포트]
+{report_text[:6000]}
+
+[사용자가 이미 입력한 내용 -- 참고용, 모순되지 않게 작성]
+{filled_lines}
+
+위 항목들을 각각 작성해 요청된 JSON 형식으로만 응답하세요."""
+
+
+def _cache_key(template_type: str, report_text: str, field_values: dict, target_fields: list[dict]) -> str:
+    payload = json.dumps(
+        {
+            "template_type": template_type,
+            "report_text": report_text,
+            "field_values": field_values,
+            "target_field_keys": sorted(field["field_key"] for field in target_fields),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return _CACHE_KEY_PREFIX + hashlib.sha256(payload.encode()).hexdigest()
+
+
+async def generate_missing_sections(
+    template_type: str,
+    report_text: str,
+    field_values: dict,
+    target_fields: list[dict],
+) -> dict[str, object]:
+    """target_fields가 비어있으면(전부 사용자가 채웠거나 CHECKLIST뿐이면) 빈 dict를 반환한다.
+
+    반환값은 {field_key: str}(TEXT) 또는 {field_key: [dict, ...]}(TABLE)이 섞여 있다.
+    """
+    if not target_fields:
+        return {}
+
+    cache_key = _cache_key(template_type, report_text, field_values, target_fields)
+    try:
+        cached = await redis_client.get(cache_key)
+        if cached is not None:
+            return json.loads(cached)
+    except Exception:
+        pass  # 캐시 조회 실패는 치명적이지 않다 -- 그냥 다시 계산한다.
+
+    client = _build_client()
+    schema = build_response_schema(target_fields)
+    system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+        template_label=_TEMPLATE_LABELS.get(template_type, template_type)
+    )
+    user_prompt = _build_user_prompt(report_text, field_values, target_fields)
+
+    try:
+        async with client:
+            response = await client.chat.completions.create(
+                model=settings.openai_model,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_schema", "json_schema": schema},
+            )
+        sections = json.loads(response.choices[0].message.content)
+    except openai.OpenAIError as error:
+        raise ProposalLLMUnavailable(f"OpenAI 호출 실패: {error}") from error
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
+        raise ProposalLLMUnavailable(f"OpenAI 응답 형식이 예상과 다릅니다: {error}") from error
+
+    try:
+        await redis_client.set(cache_key, json.dumps(sections, ensure_ascii=False), ex=_CACHE_TTL_SECONDS)
+    except Exception:
+        pass  # 캐시 저장 실패도 치명적이지 않다.
+
+    return sections
