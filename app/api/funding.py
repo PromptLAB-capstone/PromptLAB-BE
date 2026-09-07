@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+from datetime import date
+from io import BytesIO
+from typing import Annotated
+
+from fastapi import APIRouter, File, Form, UploadFile
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from pypdf import PdfReader
+from sqlalchemy import or_, select
+
+from app.db.models import FundingProgram
+from app.db.session import AsyncSessionLocal
+from app.domain.funding_match import (
+    extract_funding_profile,
+    profile_to_dict,
+    score_funding_program,
+    sort_funding_matches,
+)
+from app.schemas.common import ApiResponse
+
+router = APIRouter(prefix="/api/v1/funding", tags=["funding"])
+
+_MAX_REPORT_BYTES = 10 * 1024 * 1024
+
+
+class FundingProgramRecommendation(BaseModel):
+    program_id: str
+    title: str
+    match_score: int
+    matched_reasons: list[str]
+    deadline: date | None
+    days_left: int | None
+    max_amount: int | None
+    support_amount_text: str | None
+    region: str | None
+    stage: str | None
+    source: str | None
+    source_url: str | None
+    description: str | None
+    keywords: list[str]
+
+
+class FundingRecommendationsResult(BaseModel):
+    total: int
+    sort_order: list[str]
+    extracted_profile: dict
+    recommendations: list[FundingProgramRecommendation]
+
+
+class FundingRecommendationsResponse(ApiResponse):
+    result: FundingRecommendationsResult
+
+
+class FundingErrorResponse(ApiResponse):
+    result: None = None
+
+
+async def _error(status_code: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content=FundingErrorResponse(isSuccess=False, code=code, message=message).model_dump(),
+    )
+
+
+@router.post(
+    "/recommendations",
+    response_model=FundingRecommendationsResponse,
+    responses={
+        400: {"model": FundingErrorResponse},
+        413: {"model": FundingErrorResponse},
+        422: {"model": FundingErrorResponse},
+    },
+)
+async def recommend_funding_programs(
+    file: Annotated[UploadFile, File(description="PREP 아이디어 검진 리포트 PDF")],
+    region: Annotated[str | None, Form(description="지역 필터/가중치 보정값")] = None,
+    startup_stage: Annotated[str | None, Form(description="사업 단계 필터/가중치 보정값")] = None,
+    keywords: Annotated[str | None, Form(description="쉼표로 구분한 추가 키워드")] = None,
+    top_k: Annotated[int, Form(ge=1, le=50)] = 12,
+):
+    if not _is_pdf(file):
+        return await _error(400, "FUNDING_REPORT_PDF_REQUIRED", "PDF 파일만 업로드할 수 있습니다.")
+
+    content = await file.read()
+    if len(content) > _MAX_REPORT_BYTES:
+        return await _error(413, "FUNDING_REPORT_TOO_LARGE", "리포트 PDF는 10MB 이하만 업로드할 수 있습니다.")
+
+    report_text = _extract_pdf_text(content)
+    if len(report_text.strip()) < 20:
+        return await _error(422, "FUNDING_REPORT_TEXT_EMPTY", "PDF에서 분석 가능한 텍스트를 추출하지 못했습니다.")
+
+    profile = extract_funding_profile(
+        report_text,
+        region=region,
+        startup_stage=startup_stage,
+        keywords=keywords,
+    )
+    today = date.today()
+
+    async with AsyncSessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(FundingProgram)
+                .where(or_(FundingProgram.deadline.is_(None), FundingProgram.deadline >= today))
+                .order_by(FundingProgram.deadline.asc().nulls_last(), FundingProgram.title.asc())
+            )
+        ).scalars().all()
+
+    matches = sort_funding_matches(
+        [match for match in (score_funding_program(row, profile, today) for row in rows) if match.match_score > 0]
+    )
+    recommendations = [
+        _to_recommendation(match.program, match.match_score, match.matched_reasons, match.days_left)
+        for match in matches[:top_k]
+    ]
+
+    return FundingRecommendationsResponse(
+        isSuccess=True,
+        code="FUNDING_RECOMMENDATIONS_FOUND",
+        message="지원사업 추천 결과를 조회했습니다.",
+        result=FundingRecommendationsResult(
+            total=len(recommendations),
+            sort_order=["match_score_desc", "deadline_asc", "max_amount_desc"],
+            extracted_profile=profile_to_dict(profile),
+            recommendations=recommendations,
+        ),
+    )
+
+
+def _is_pdf(file: UploadFile) -> bool:
+    filename = (file.filename or "").lower()
+    content_type = (file.content_type or "").lower()
+    return filename.endswith(".pdf") or content_type == "application/pdf"
+
+
+def _extract_pdf_text(content: bytes) -> str:
+    try:
+        reader = PdfReader(BytesIO(content))
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    except Exception:
+        return ""
+
+
+def _to_recommendation(
+    program: FundingProgram,
+    match_score: int,
+    matched_reasons: list[str],
+    days_left: int | None,
+) -> FundingProgramRecommendation:
+    return FundingProgramRecommendation(
+        program_id=program.program_id,
+        title=program.title,
+        match_score=match_score,
+        matched_reasons=matched_reasons,
+        deadline=program.deadline,
+        days_left=days_left,
+        max_amount=program.max_amount,
+        support_amount_text=program.support_amount_text,
+        region=program.region,
+        stage=program.stage,
+        source=program.source,
+        source_url=program.source_url,
+        description=program.description,
+        keywords=program.keywords or [],
+    )

@@ -17,6 +17,7 @@ from app.db.models.correction_rule import CorrectionRule
 from app.db.models.difficulty import CollectionDifficulty, DataDifficulty
 from app.db.models.evidence_chunk import EvidenceChunk
 from app.db.models.evidence_document import EvidenceDocument
+from app.db.models.funding import FundingProgram
 from app.db.models.gate_keyword import GateKeyword
 from app.db.models.gate_matrix import GateMatrix
 from app.db.models.rule_version import RuleVersion
@@ -36,6 +37,7 @@ __all__ = [
     "DataSensitivity",
     "EvidenceChunk",
     "EvidenceDocument",
+    "FundingProgram",
     "GateKeyword",
     "GateMatrix",
     "HealthDataItem",

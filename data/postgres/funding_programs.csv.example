@@ -1,0 +1,2 @@
+program_id,title,region,stage,eligibility_json,open_date,deadline,max_amount,support_amount_text,source,source_url,description,keywords
+kstartup-example-001,AI 서비스 창업 지원사업,전국,예비창업,"{""target"": ""예비창업자"", ""industry"": ""AI 서비스""}",2026-09-01,2026-09-30,50000000,"최대 5,000만원",K-Startup,https://www.k-startup.go.kr/,AI 기반 서비스 개발비를 지원하는 예시 행입니다. 실제 공고 수집 후 교체하세요.,"AI,서비스,예비창업"
