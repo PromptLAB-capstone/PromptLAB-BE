@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
-from app.db.models import FundingProgram
-
 
 _CATEGORY_1 = [
     "수면",
@@ -133,6 +131,23 @@ class FundingProfile:
     region: str | None
     startup_stage: str | None
     keywords: list[str]
+
+
+@dataclass(frozen=True)
+class FundingProgram:
+    program_id: str
+    title: str
+    region: str | None = None
+    stage: str | None = None
+    eligibility: dict[str, Any] | None = None
+    open_date: date | None = None
+    deadline: date | None = None
+    max_amount: int | None = None
+    support_amount_text: str | None = None
+    source: str | None = None
+    source_url: str | None = None
+    description: str | None = None
+    keywords: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -316,8 +331,8 @@ def _program_searchable_text(program: FundingProgram) -> str:
         program.support_amount_text or "",
         " ".join(program.keywords or []),
     ]
-    if program.eligibility_json:
-        values.append(" ".join(str(v) for v in program.eligibility_json.values()))
+    if program.eligibility:
+        values.append(" ".join(str(v) for v in program.eligibility.values()))
     return " ".join(values)
 
 

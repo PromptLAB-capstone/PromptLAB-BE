@@ -8,16 +8,15 @@ from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pypdf import PdfReader
-from sqlalchemy import or_, select
 
-from app.db.models import FundingProgram
-from app.db.session import AsyncSessionLocal
 from app.domain.funding_match import (
+    FundingProgram,
     extract_funding_profile,
     profile_to_dict,
     score_funding_program,
     sort_funding_matches,
 )
+from app.domain.funding_sources import fetch_external_funding_programs
 from app.schemas.common import ApiResponse
 
 router = APIRouter(prefix="/api/v1/funding", tags=["funding"])
@@ -46,6 +45,8 @@ class FundingRecommendationsResult(BaseModel):
     total: int
     sort_order: list[str]
     extracted_profile: dict
+    sources: list[str]
+    source_warnings: list[str]
     recommendations: list[FundingProgramRecommendation]
 
 
@@ -99,17 +100,15 @@ async def recommend_funding_programs(
     )
     today = date.today()
 
-    async with AsyncSessionLocal() as session:
-        rows = (
-            await session.execute(
-                select(FundingProgram)
-                .where(or_(FundingProgram.deadline.is_(None), FundingProgram.deadline >= today))
-                .order_by(FundingProgram.deadline.asc().nulls_last(), FundingProgram.title.asc())
-            )
-        ).scalars().all()
+    rows, source_warnings = await fetch_external_funding_programs(profile)
+    active_rows = [row for row in rows if row.deadline is None or row.deadline >= today]
 
     matches = sort_funding_matches(
-        [match for match in (score_funding_program(row, profile, today) for row in rows) if match.match_score > 0]
+        [
+            match
+            for match in (score_funding_program(row, profile, today) for row in active_rows)
+            if match.match_score > 0
+        ]
     )
     recommendations = [
         _to_recommendation(match.program, match.match_score, match.matched_reasons, match.days_left)
@@ -124,6 +123,8 @@ async def recommend_funding_programs(
             total=len(recommendations),
             sort_order=["match_score_desc", "deadline_asc", "max_amount_desc"],
             extracted_profile=profile_to_dict(profile),
+            sources=sorted({row.source for row in rows if row.source}),
+            source_warnings=source_warnings,
             recommendations=recommendations,
         ),
     )

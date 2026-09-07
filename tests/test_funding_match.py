@@ -1,7 +1,7 @@
 from datetime import date
 
-from app.db.models import FundingProgram
 from app.domain.funding_match import (
+    FundingProgram,
     extract_funding_profile,
     score_funding_program,
     sort_funding_matches,
