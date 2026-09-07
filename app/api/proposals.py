@@ -1,0 +1,312 @@
+"""제안서 자동 작성 API (이슈 #102, docs/제안서_자동작성_API_명세서.md).
+
+app/api/funding.py(PR #101)와 동일한 컨벤션을 따른다 -- UploadFile+Form, 10MB 제한,
+_error() 헬퍼, ApiResponse envelope. 검진 리포트 PDF를 텍스트로 추출하는 부분은 지금
+funding.py와 중복 구현이다 -- app/domain/pdf_utils.py 같은 공유 모듈 분리는 funding
+담당과 협의 후 별도 진행 (§6-3).
+
+⚠️ 이번 작업 범위: DB 스키마 + 엔드포인트 뼈대(요청/응답 계약, Redis TTL 캐시 정책)까지다.
+LLM 프롬프트 설계(_generate_section_text의 실제 생성 로직)와 PDF 바이너리 생성
+(get_proposal_pdf, 현재는 JSON 반환)은 후속 작업으로 명시적으로 남겨둔다.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
+from typing import Annotated
+
+from fastapi import APIRouter, File, Form, UploadFile
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from pypdf import PdfReader
+from sqlalchemy import select
+
+from app.core.redis_client import redis_client
+from app.db.models import ProposalFieldDefinition, ProposalTemplateFieldMap
+from app.db.session import AsyncSessionLocal
+from app.schemas.common import ApiResponse
+
+router = APIRouter(prefix="/api/v1/proposals", tags=["proposals"])
+
+_MAX_REPORT_BYTES = 10 * 1024 * 1024
+_PROPOSAL_TTL_SECONDS = 600
+_CACHE_KEY_PREFIX = "proposal:"
+TEMPLATE_TYPES = frozenset({"PSST", "RND", "IR"})
+
+
+class ProposalErrorResponse(ApiResponse):
+    result: None = None
+
+
+async def _error(status_code: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content=ProposalErrorResponse(isSuccess=False, code=code, message=message).model_dump(),
+    )
+
+
+def _is_pdf(file: UploadFile) -> bool:
+    filename = (file.filename or "").lower()
+    content_type = (file.content_type or "").lower()
+    return filename.endswith(".pdf") or content_type == "application/pdf"
+
+
+def _extract_pdf_text(content: bytes) -> str:
+    reader = PdfReader(BytesIO(content))
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+# ---------------------------------------------------------------------------
+# GET /field-definitions
+# ---------------------------------------------------------------------------
+
+
+class FieldDefinitionItem(BaseModel):
+    field_key: str
+    category: str
+    label: str
+    field_type: str
+    requirement: str
+    display_order: int
+
+
+class FieldDefinitionsResult(BaseModel):
+    template_type: str
+    fields: list[FieldDefinitionItem]
+
+
+class FieldDefinitionsResponse(ApiResponse):
+    result: FieldDefinitionsResult
+
+
+async def _fetch_field_definitions(template_type: str) -> list[FieldDefinitionItem]:
+    async with AsyncSessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(
+                    ProposalFieldDefinition.field_key,
+                    ProposalFieldDefinition.category,
+                    ProposalFieldDefinition.label,
+                    ProposalFieldDefinition.field_type,
+                    ProposalFieldDefinition.display_order,
+                    ProposalTemplateFieldMap.requirement,
+                )
+                .join(
+                    ProposalTemplateFieldMap,
+                    ProposalTemplateFieldMap.field_key == ProposalFieldDefinition.field_key,
+                )
+                .where(ProposalTemplateFieldMap.template_type == template_type)
+                .order_by(ProposalFieldDefinition.display_order)
+            )
+        ).all()
+
+    return [
+        FieldDefinitionItem(
+            field_key=row.field_key,
+            category=row.category,
+            label=row.label,
+            field_type=row.field_type,
+            requirement=row.requirement,
+            display_order=row.display_order,
+        )
+        for row in rows
+    ]
+
+
+@router.get(
+    "/field-definitions",
+    response_model=FieldDefinitionsResponse,
+    responses={400: {"model": ProposalErrorResponse}},
+)
+async def get_field_definitions(template_type: str) -> FieldDefinitionsResponse | JSONResponse:
+    if template_type not in TEMPLATE_TYPES:
+        return await _error(
+            400,
+            "PROPOSAL_TEMPLATE_TYPE_INVALID",
+            f"template_type은 {sorted(TEMPLATE_TYPES)} 중 하나여야 합니다.",
+        )
+
+    fields = await _fetch_field_definitions(template_type)
+    return FieldDefinitionsResponse(
+        isSuccess=True,
+        code="COMMON200",
+        message="성공",
+        result=FieldDefinitionsResult(template_type=template_type, fields=fields),
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /generate
+# ---------------------------------------------------------------------------
+
+
+class ProposalSection(BaseModel):
+    field_key: str
+    label: str
+    generated_text: str
+
+
+class GenerateResult(BaseModel):
+    proposal_id: str
+    template_type: str
+    sections: list[ProposalSection]
+
+
+class GenerateResponse(ApiResponse):
+    result: GenerateResult
+
+
+def _generate_section_text(field_key: str, report_text: str, field_values: dict) -> str:
+    """LLM 프롬프트 설계는 이번 작업 범위 밖이다 (팀 결정, 2026-09-07).
+
+    지금은 사용자가 화면에서 입력한 값이 있으면 그대로 통과시키고, 없으면 자리표시자를
+    반환한다 -- generate 엔드포인트의 요청/응답 계약과 "완료 전엔 캐시하지 않는다"는
+    정책을 먼저 굳히기 위한 스텁이다. report_text는 다음 단계(프롬프트 설계)에서
+    실제로 사용된다.
+    """
+    del report_text  # 다음 단계(LLM 프롬프트 설계)에서 사용 예정
+    user_value = field_values.get(field_key)
+    if isinstance(user_value, str) and user_value.strip():
+        return user_value
+    return f"[TODO: LLM 초안 생성 예정 -- {field_key}]"
+
+
+@router.post(
+    "/generate",
+    response_model=GenerateResponse,
+    responses={
+        400: {"model": ProposalErrorResponse},
+        413: {"model": ProposalErrorResponse},
+    },
+)
+async def generate_proposal(
+    report: Annotated[UploadFile, File(description="PREP 아이디어 검진 리포트 PDF")],
+    template_type: Annotated[str, Form(description="PSST / RND / IR")],
+    field_values: Annotated[str, Form(description="사용자가 채운 필드값(JSON 문자열)")] = "{}",
+) -> GenerateResponse | JSONResponse:
+    if template_type not in TEMPLATE_TYPES:
+        return await _error(
+            400,
+            "PROPOSAL_TEMPLATE_TYPE_INVALID",
+            f"template_type은 {sorted(TEMPLATE_TYPES)} 중 하나여야 합니다.",
+        )
+
+    if not _is_pdf(report):
+        return await _error(400, "PROPOSAL_REPORT_PDF_REQUIRED", "PDF 파일만 업로드할 수 있습니다.")
+
+    content = await report.read()
+    if len(content) > _MAX_REPORT_BYTES:
+        return await _error(413, "PROPOSAL_REPORT_TOO_LARGE", "리포트 PDF는 10MB 이하만 업로드할 수 있습니다.")
+
+    try:
+        values = json.loads(field_values) if field_values else {}
+    except json.JSONDecodeError:
+        return await _error(400, "PROPOSAL_FIELD_VALUES_INVALID", "field_values는 올바른 JSON 문자열이어야 합니다.")
+
+    report_text = _extract_pdf_text(content)
+    fields = await _fetch_field_definitions(template_type)
+
+    sections = [
+        ProposalSection(
+            field_key=field.field_key,
+            label=field.label,
+            generated_text=_generate_section_text(field.field_key, report_text, values),
+        )
+        for field in fields
+    ]
+
+    # 완료(POST /{id}/complete) 전까지는 캐시하지 않는다 (§0, §5.2) -- 재요청 시 매번 새로 생성.
+    return GenerateResponse(
+        isSuccess=True,
+        code="COMMON200",
+        message="성공",
+        result=GenerateResult(proposal_id=str(uuid.uuid4()), template_type=template_type, sections=sections),
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /{proposal_id}/complete, GET /{proposal_id}/pdf
+# ---------------------------------------------------------------------------
+
+
+class CompleteSection(BaseModel):
+    field_key: str
+    final_text: str
+
+
+class CompleteRequest(BaseModel):
+    sections: list[CompleteSection]
+
+
+class CompleteResult(BaseModel):
+    proposal_id: str
+    expires_at: datetime
+
+
+class CompleteResponse(ApiResponse):
+    result: CompleteResult
+
+
+@router.post("/{proposal_id}/complete", response_model=CompleteResponse)
+async def complete_proposal(proposal_id: str, request: CompleteRequest) -> CompleteResponse:
+    """"완료" 또는 "PDF 저장하기" 클릭 시 호출 -- 둘 다 동일 트리거로 취급한다(§0).
+
+    이 시점부터 Redis TTL 10분이 시작된다. TTL 만료 후에는 GET .../pdf가
+    PROPOSAL_NOT_FOUND(404)를 반환한다 -- Redis가 자동으로 지우므로 별도 삭제 API는 없다.
+    """
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=_PROPOSAL_TTL_SECONDS)
+    payload = {
+        "proposal_id": proposal_id,
+        "sections": [section.model_dump() for section in request.sections],
+        "expires_at": expires_at.isoformat(),
+    }
+    await redis_client.set(_CACHE_KEY_PREFIX + proposal_id, json.dumps(payload), ex=_PROPOSAL_TTL_SECONDS)
+
+    return CompleteResponse(
+        isSuccess=True,
+        code="COMMON200",
+        message="성공",
+        result=CompleteResult(proposal_id=proposal_id, expires_at=expires_at),
+    )
+
+
+class ProposalContentResult(BaseModel):
+    proposal_id: str
+    sections: list[CompleteSection]
+    expires_at: datetime
+
+
+class ProposalContentResponse(ApiResponse):
+    result: ProposalContentResult
+
+
+@router.get(
+    "/{proposal_id}/pdf",
+    response_model=ProposalContentResponse,
+    responses={404: {"model": ProposalErrorResponse}},
+)
+async def get_proposal_pdf(proposal_id: str) -> ProposalContentResponse | JSONResponse:
+    """⚠️ 실제 PDF 바이너리 생성은 이번 작업 범위 밖이다 (§6-1 후속 논의 -- 동기 생성 vs
+    presigned URL 방식 미정, requirements.txt에 PDF 생성 라이브러리(reportlab/weasyprint
+    등)가 아직 없어 라이브러리 선택부터 필요). 지금은 완료된 제안서 내용을 JSON으로
+    반환한다 -- 프론트가 이 데이터로 화면 렌더링 후 브라우저 인쇄 등으로 임시 대응하거나,
+    PDF 라이브러리 선택 후 이 엔드포인트를 실제 바이너리 응답으로 교체한다.
+    """
+    cached = await redis_client.get(_CACHE_KEY_PREFIX + proposal_id)
+    if cached is None:
+        return await _error(404, "PROPOSAL_NOT_FOUND", "제안서를 찾을 수 없거나 만료되었습니다.")
+
+    payload = json.loads(cached)
+    return ProposalContentResponse(
+        isSuccess=True,
+        code="COMMON200",
+        message="성공",
+        result=ProposalContentResult(
+            proposal_id=payload["proposal_id"],
+            sections=[CompleteSection(**section) for section in payload["sections"]],
+            expires_at=payload["expires_at"],
+        ),
+    )
