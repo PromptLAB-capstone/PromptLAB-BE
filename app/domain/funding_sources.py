@@ -53,7 +53,8 @@ _DESCRIPTION_KEYS = [
     "사업내용",
     "공고내용",
 ]
-_AMOUNT_KEYS = ["supt_biz_clsfc", "support_amount", "max_amount", "지원금액", "지원내용"]
+_AMOUNT_KEYS = ["support_amount", "max_amount", "지원금액", "지원내용"]
+_SUPPORT_CATEGORY_KEYS = ["supt_biz_clsfc", "지원사업분류", "지원분야"]
 _KEYWORD_KEYS = ["biz_category", "category", "field", "keywords", "분야", "키워드"]
 
 
@@ -85,13 +86,7 @@ async def fetch_kstartup_programs(profile: FundingProfile) -> tuple[list[Funding
     if not settings.public_data_service_key:
         return [], "PUBLIC_DATA_SERVICE_KEY가 없어 K-Startup OpenAPI 조회를 건너뛰었습니다."
 
-    params = {
-        "serviceKey": settings.public_data_service_key,
-        "pageNo": 1,
-        "numOfRows": settings.funding_fetch_limit,
-        "returnType": "json",
-        "dataType": "json",
-    }
+    params = _kstartup_request_params()
     # 공공데이터포털 조건 검색 파라미터는 서비스별로 동작 방식이 달라 0건을
     # 반환하는 경우가 있다. 최신 공고를 넓게 가져오고 내부 점수화로 거르는 편이
     # 추천 누락 위험이 작다.
@@ -186,7 +181,9 @@ def _normalize_program(row: dict[str, Any], *, source: str) -> FundingProgram | 
     if not title:
         return None
     source_url = _pick(row, _URL_KEYS)
-    support_text = _pick(row, _AMOUNT_KEYS)
+    support_amount_text = _pick(row, _AMOUNT_KEYS)
+    support_category_text = _pick(row, _SUPPORT_CATEGORY_KEYS)
+    support_text = support_amount_text or support_category_text
     description = _pick(row, _DESCRIPTION_KEYS)
     keywords = _split_keywords(_pick(row, _KEYWORD_KEYS))
     if description:
@@ -200,13 +197,26 @@ def _normalize_program(row: dict[str, Any], *, source: str) -> FundingProgram | 
         eligibility={key: row[key] for key in _STAGE_KEYS if key in row},
         open_date=_parse_date(_pick(row, _OPEN_DATE_KEYS)),
         deadline=_parse_date(_pick(row, _DEADLINE_KEYS)),
-        max_amount=_parse_amount(support_text or description or title),
+        max_amount=_parse_amount(" ".join(value for value in [support_amount_text, description, title] if value)),
         support_amount_text=support_text,
         source=source,
         source_url=source_url,
         description=description,
         keywords=_unique(keywords),
     )
+
+
+def _kstartup_request_params() -> dict[str, Any]:
+    limit = max(1, settings.funding_fetch_limit)
+    return {
+        "serviceKey": settings.public_data_service_key,
+        "page": 1,
+        "perPage": limit,
+        "pageNo": 1,
+        "numOfRows": limit,
+        "returnType": "json",
+        "dataType": "json",
+    }
 
 
 def _parse_startup_plus_html(text: str) -> list[FundingProgram]:
