@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
 from typing import Annotated
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import JSONResponse
@@ -22,6 +23,7 @@ from app.schemas.common import ApiResponse
 router = APIRouter(prefix="/api/v1/funding", tags=["funding"])
 
 _MAX_REPORT_BYTES = 10 * 1024 * 1024
+_SERVICE_TIMEZONE = ZoneInfo("Asia/Seoul")
 
 
 class FundingProgramRecommendation(BaseModel):
@@ -43,6 +45,8 @@ class FundingProgramRecommendation(BaseModel):
 
 class FundingRecommendationsResult(BaseModel):
     total: int
+    recommended_at: datetime
+    basis_date: date
     sort_order: list[str]
     extracted_profile: dict
     sources: list[str]
@@ -98,7 +102,8 @@ async def recommend_funding_programs(
         startup_stage=startup_stage,
         keywords=keywords,
     )
-    today = date.today()
+    recommended_at = datetime.now(_SERVICE_TIMEZONE)
+    today = recommended_at.date()
 
     rows, source_warnings = await fetch_external_funding_programs(profile)
     active_rows = [row for row in rows if row.deadline is None or row.deadline >= today]
@@ -121,6 +126,8 @@ async def recommend_funding_programs(
         message="지원사업 추천 결과를 조회했습니다.",
         result=FundingRecommendationsResult(
             total=len(recommendations),
+            recommended_at=recommended_at,
+            basis_date=today,
             sort_order=["match_score_desc", "deadline_asc", "max_amount_desc"],
             extracted_profile=profile_to_dict(profile),
             sources=sorted({row.source for row in rows if row.source}),
