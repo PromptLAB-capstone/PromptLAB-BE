@@ -27,16 +27,32 @@ _URL_KEYS = ["detl_pg_url", "detailurl", "detail_url", "url", "source_url", "pba
 _DEADLINE_KEYS = [
     "biz_rcept_end_dt",
     "rcept_end_dt",
+    "pbanc_rcpt_end_dt",
     "reception_end_date",
     "endDate",
     "deadline",
     "접수종료일",
     "마감일",
 ]
-_OPEN_DATE_KEYS = ["biz_rcept_bgng_dt", "rcept_bgng_dt", "startDate", "open_date", "접수시작일"]
+_OPEN_DATE_KEYS = [
+    "biz_rcept_bgng_dt",
+    "rcept_bgng_dt",
+    "pbanc_rcpt_bgng_dt",
+    "startDate",
+    "open_date",
+    "접수시작일",
+]
 _REGION_KEYS = ["supt_regin", "region", "area", "지역"]
-_STAGE_KEYS = ["aply_trgt_ctnt", "target", "stage", "지원대상", "대상"]
-_DESCRIPTION_KEYS = ["biz_pbanc_ctnt", "pbanc_ctnt", "description", "summary", "content", "사업내용", "공고내용"]
+_STAGE_KEYS = ["aply_trgt_ctnt", "aply_trgt", "biz_enyy", "target", "stage", "지원대상", "대상"]
+_DESCRIPTION_KEYS = [
+    "biz_pbanc_ctnt",
+    "pbanc_ctnt",
+    "description",
+    "summary",
+    "content",
+    "사업내용",
+    "공고내용",
+]
 _AMOUNT_KEYS = ["supt_biz_clsfc", "support_amount", "max_amount", "지원금액", "지원내용"]
 _KEYWORD_KEYS = ["biz_category", "category", "field", "keywords", "분야", "키워드"]
 
@@ -65,6 +81,7 @@ async def fetch_external_funding_programs(profile: FundingProfile) -> tuple[list
 
 
 async def fetch_kstartup_programs(profile: FundingProfile) -> tuple[list[FundingProgram], str | None]:
+    del profile  # 최신 공고를 넓게 가져온 뒤 내부 매칭 점수로 정렬한다.
     if not settings.public_data_service_key:
         return [], "PUBLIC_DATA_SERVICE_KEY가 없어 K-Startup OpenAPI 조회를 건너뛰었습니다."
 
@@ -75,9 +92,9 @@ async def fetch_kstartup_programs(profile: FundingProfile) -> tuple[list[Funding
         "returnType": "json",
         "dataType": "json",
     }
-    query = _best_query(profile)
-    if query:
-        params["cond[bizPbancNm::LIKE]"] = query
+    # 공공데이터포털 조건 검색 파라미터는 서비스별로 동작 방식이 달라 0건을
+    # 반환하는 경우가 있다. 최신 공고를 넓게 가져오고 내부 점수화로 거르는 편이
+    # 추천 누락 위험이 작다.
 
     try:
         async with httpx.AsyncClient(timeout=settings.funding_request_timeout_seconds) as client:
@@ -227,7 +244,7 @@ def _pick(row: dict[str, Any], keys: list[str]) -> str | None:
         value = row.get(key)
         if value is None:
             value = lowered.get(key.lower())
-        text = str(value or "").strip()
+        text = html.unescape(str(value or "")).strip()
         if text:
             return text
     return None
@@ -290,13 +307,6 @@ def _keyword_hits(value: str) -> list[str]:
     ]
     compact = re.sub(r"\s+", "", value).lower()
     return [candidate for candidate in candidates if re.sub(r"\s+", "", candidate).lower() in compact]
-
-
-def _best_query(profile: FundingProfile) -> str | None:
-    for value in [profile.category_1, profile.service_type, *profile.keywords]:
-        if value and len(value.strip()) >= 2:
-            return value.strip()
-    return None
 
 
 def _dedupe_programs(programs: list[FundingProgram]) -> list[FundingProgram]:
