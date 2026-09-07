@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     category_model_backend: str = "onnx"
     naver_client_id: str = ""
     naver_client_secret: str = ""
+    public_data_service_key: str = ""
+    kstartup_api_url: str = "https://apis.data.go.kr/B552735/kisedKstartupService01/getAnnouncementInformation01"
+    funding_fetch_limit: int = 100
+    funding_request_timeout_seconds: float = 8.0
+    startup_plus_project_url: str = "https://www.startup-plus.kr/project"
 
     model_config = SettingsConfigDict(
         env_file=".env",
