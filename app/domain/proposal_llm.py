@@ -170,10 +170,13 @@ def _build_user_prompt(report_text: str, field_values: dict, target_fields: list
 
 
 def _cache_key(template_type: str, report_text: str, field_values: dict, target_fields: list[dict]) -> str:
+    # report_text는 프롬프트에 넣기 전 6000자로 자르므로(_build_user_prompt), 캐시 키도
+    # 똑같이 잘라서 해시한다 -- 안 그러면 6000자 이후만 다른 리포트가 매번 캐시 미스로
+    # 새로 호출돼 캐싱 효과가 없어진다.
     payload = json.dumps(
         {
             "template_type": template_type,
-            "report_text": report_text,
+            "report_text": report_text[:6000],
             "field_values": field_values,
             "target_field_keys": sorted(field["field_key"] for field in target_fields),
         },

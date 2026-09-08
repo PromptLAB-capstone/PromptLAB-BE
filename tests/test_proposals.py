@@ -308,6 +308,20 @@ def test_render_proposal_pdf_embeds_korean_font_not_just_referenced() -> None:
     assert _font_is_embedded(pdf_bytes, "NanumGothic")
 
 
+def test_render_proposal_pdf_handles_mismatched_field_type_and_value_without_raising() -> None:
+    # 리뷰 중 발견한 회귀: complete 요청의 field_type은 클라이언트가 그대로 보내오므로,
+    # 프론트가 실수로 TABLE 필드에 문자열 value를 보내면 고치기 전에는
+    # rows[0].keys()에서 AttributeError -> GET /{id}/pdf 전체가 500으로 죽었다.
+    pdf_bytes = render_proposal_pdf(
+        "PSST",
+        [
+            {"field_key": "growth_targets", "label": "정량적 성장목표", "field_type": "TABLE", "value": "문자열이 잘못 옴"},
+            {"field_key": "attachment_checklist", "label": "첨부서류", "field_type": "CHECKLIST", "value": "이것도 문자열"},
+        ],
+    )
+    assert pdf_bytes[:4] == b"%PDF"
+
+
 def test_render_proposal_pdf_handles_empty_values_without_raising() -> None:
     pdf_bytes = render_proposal_pdf(
         "IR",

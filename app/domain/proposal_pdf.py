@@ -84,21 +84,30 @@ def render_proposal_pdf(template_type: str, sections: list[dict]) -> bytes:
 
 
 def _render_value(field_type: str, value: object):
+    """field_type과 value의 실제 모양이 어긋나면(예: TABLE인데 문자열이 옴) 예외를
+    던지지 않고 안전하게 렌더링한다.
+
+    ⚠️ **리뷰 중 발견한 회귀**: `POST /{id}/complete`의 CompleteSection은 field_key뿐
+    아니라 field_type/value도 클라이언트(프론트)가 그대로 보내온 값을 신뢰한다 --
+    즉 프론트 구현이 잘못돼서 field_type="TABLE"인데 value로 문자열을 보내면, 고치기
+    전에는 `rows[0]`가 문자열의 첫 글자가 되고 `.keys()` 호출에서 AttributeError가
+    나서 `GET /{id}/pdf` 전체가 처리되지 않은 500으로 죽었다. CHECKLIST도 마찬가지로
+    문자열이 오면 글자 단위로 쪼개져 불릿마다 한 글자씩 찍히는 조용한 오류였다.
+    아래 isinstance 체크가 그 두 경우 모두를 막는다.
+    """
     if field_type == "CHECKLIST":
-        items = value or []
-        if not items:
-            return Paragraph("(항목 없음)", _BODY_STYLE)
+        if not isinstance(value, list) or not value:
+            return Paragraph("(항목 없음)" if not value else "(형식 오류로 표시할 수 없습니다)", _BODY_STYLE)
         return ListFlowable(
-            [ListItem(Paragraph(str(item), _BODY_STYLE)) for item in items],
+            [ListItem(Paragraph(str(item), _BODY_STYLE)) for item in value],
             bulletType="bullet",
         )
 
     if field_type == "TABLE":
-        rows = value or []
-        if not rows:
-            return Paragraph("(작성된 내용 없음)", _BODY_STYLE)
-        headers = list(rows[0].keys())
-        data = [headers] + [[str(row.get(header, "")) for header in headers] for row in rows]
+        if not isinstance(value, list) or not value or not all(isinstance(row, dict) for row in value):
+            return Paragraph("(작성된 내용 없음)" if not value else "(형식 오류로 표시할 수 없습니다)", _BODY_STYLE)
+        headers = list(value[0].keys())
+        data = [headers] + [[str(row.get(header, "")) for header in headers] for row in value]
         table = Table(data)
         table.setStyle(
             TableStyle(
