@@ -188,7 +188,7 @@ Authorization: Bearer `<accessToken>`
 
 리포트 PDF 텍스트 추출은 funding.py의 `_extract_pdf_text`/`_is_pdf`를 그대로 재사용하거나(가능하면 `app/domain/pdf_utils.py` 등 공유 모듈로 뽑아서 두 기능이 함께 쓰는 것을 권장 — §6-3 참고), 최소한 같은 에러 코드 네이밍(`PROPOSAL_REPORT_PDF_REQUIRED`/`PROPOSAL_REPORT_TOO_LARGE`)을 맞춘다.
 
-`field_values`의 값 타입은 §3.1 `field_type`을 따른다 — `TEXT`는 문자열, `CHECKLIST`는 문자열 배열, `TABLE`은 `[{"year": 1, "revenue": 0, "headcount": 0}, ...]` 형태의 배열.
+`field_values`의 값 타입은 §3.1 `field_type`을 따른다 — `TEXT`는 문자열, `CHECKLIST`는 문자열 배열, `TABLE`은 `[{"year": 1, "revenue_krw": 0, "headcount": 0, "basis": "..."}, ...]` 형태의 배열(필드별 정확한 컬럼은 `app/domain/proposal_llm.py`의 `TABLE_ITEM_SCHEMAS` 참고).
 
 ```json
 // 에러 응답 예시 (400 / 413, funding.py와 동일 패턴)
@@ -204,22 +204,37 @@ Authorization: Bearer `<accessToken>`
   "result": {
     "proposal_id": "string",
     "template_type": "PSST",
+    "llm_status": "ok",
     "sections": [
-      { "field_key": "company_overview", "label": "기업개요·대표자", "generated_text": "string" }
+      { "field_key": "company_overview", "label": "기업개요·대표자", "field_type": "TEXT", "value": "string" },
+      { "field_key": "attachment_checklist", "label": "첨부서류 체크리스트", "field_type": "CHECKLIST", "value": ["사업자등록증(또는 사업자등록 예정 확인서)", "대표자 신분증 사본", "개인정보 수집·이용 동의서"] },
+      { "field_key": "growth_targets", "label": "정량적 성장목표", "field_type": "TABLE", "value": [ { "year": 1, "revenue_krw": 50000000, "headcount": 2, "basis": "..." } ] }
     ]
   }
 }
 ```
 
-이 시점(완료 전)에는 캐시에 저장하지 않는다 — 재요청 시 매번 새로 생성.
+`sections`는 세 갈래로 채워진다: ① 사용자가 이미 입력한 필드는 그 값 그대로, ② `CHECKLIST` 타입(`attachment_checklist`)은 `app/domain/proposal_llm.py`의 `ATTACHMENT_CHECKLISTS`에서 유형별 고정 목록을 조회(LLM 미사용), ③ 나머지(TEXT/TABLE, 사용자 미입력분)만 **유형 하나당 LLM 호출 1번**으로 한꺼번에 생성한다 — 33개 필드를 각각 호출하지 않는다.
+
+`llm_status`가 `"unavailable"`이면 ③에 해당하는 필드들이 실제 생성 대신 자리표시자(`"[자동 생성 실패 -- 직접 입력해주세요: <라벨>]"`, TABLE은 빈 배열)로 채워진 것이다 — §10.1 원칙("LLM 장애로 핵심 응답이 깨지면 안 된다")에 따라 요청 자체는 502로 실패하지 않는다. 프론트는 이 값을 보고 안내 배너를 띄우는 걸 권장.
+
+이 시점(완료 전)에는 이 응답 전체를 캐시에 저장하지 않는다 — 재요청 시 매번 새로 생성. (단, ③의 LLM 호출 결과 자체는 `app/domain/proposal_llm.py` 내부에서 동일 입력이면 10분간 재사용된다 — 완료 전 재시도 비용 절감용으로, 제안서 자체의 10분 TTL과는 별개 목적이다.)
 
 ### 5.3 `POST /api/v1/proposals/{proposal_id}/complete`
 
 "완료" 또는 "PDF 저장하기" 클릭 시 호출. 사용자가 수정한 최종본을 받아 Redis에 저장하고 10분 TTL을 시작한다.
 
 ```json
-// 요청
-{ "sections": [ { "field_key": "company_overview", "final_text": "string" } ] }
+// 요청 -- template_type은 GET .../pdf가 문서 제목을 고르는 데 필요해서 이 시점에 함께 저장한다.
+// sections의 label/field_type도 함께 보낸다 -- PDF 렌더러(app/domain/proposal_pdf.py)가
+// field_key만으로는 다시 DB를 조회하지 않고 그대로 렌더링하도록 하기 위함.
+// value 타입은 generate 응답과 동일하게 field_type을 따른다(TEXT=문자열/CHECKLIST=배열/TABLE=배열)
+{
+  "template_type": "PSST",
+  "sections": [
+    { "field_key": "company_overview", "label": "기업개요·대표자", "field_type": "TEXT", "value": "string" }
+  ]
+}
 ```
 
 ```json
@@ -234,10 +249,12 @@ Authorization: Bearer `<accessToken>`
 
 ### 5.4 `GET /api/v1/proposals/{proposal_id}/pdf`
 
-10분 이내에만 다운로드 가능. `complete` 호출 전이면 404.
+10분 이내에만 다운로드 가능. `complete` 호출 전이면 404. **응답이 JSON이 아니라 실제 PDF 바이너리다** (`Content-Type: application/pdf`, `Content-Disposition: attachment; filename="proposal_{id}.pdf"`).
+
+`app/domain/proposal_pdf.py`(reportlab)가 렌더링한다. 한글은 PDF 표준 CID 폰트(예: HYGothic-Medium)를 쓰지 않는다 — 실제로 렌더링해보니 한글 폰트가 없는 뷰어/서버에서는 글자가 통째로 빈 칸으로 나오는 걸 확인했다. 대신 나눔고딕 TTF를 `app/assets/fonts/`에 실제로 넣고 PDF에 임베딩한다(자동 서브셋팅으로 실사용 용량은 수십 KB 수준, OFL 라이선스로 재배포 가능).
 
 ```json
-// 만료/미완료 시 에러 응답 (404)
+// 만료/미완료 시 에러 응답 (404, 이 경우만 JSON)
 {
   "isSuccess": false,
   "code": "PROPOSAL_NOT_FOUND",
@@ -250,7 +267,10 @@ Authorization: Bearer `<accessToken>`
 
 | # | 항목 |
 |---|---|
-| 1 | PDF 생성을 동기(요청-응답)로 할지, presigned URL 발급 방식으로 할지 |
-| 2 | `generate` 응답 이후 사용자가 재생성을 요청할 수 있는 횟수 제한 여부 |
-| 3 | **(리뷰 중 갱신)** PDF 텍스트 추출(`_extract_pdf_text`/`_is_pdf`, PDF 검증·크기 제한)을 `funding.py`와 이 기능이 각각 구현할지, `app/domain/pdf_utils.py` 같은 공유 모듈로 뽑을지 — funding 담당과 협의 필요 |
-| 4 | **(신규)** `extract_funding_profile`(funding_match.py)이 리포트에서 이미 `category_1`/`category_2`/`service_type`/`target`/`region`/`stage`를 추출하고 있음 — 이 결과를 제안서 `field_values`의 일부(예: `target_market_analysis`, `company_overview`) 초기값으로 재사용해 사용자 입력 부담을 줄일 수 있는지 검토 |
+| 1 | `generate` 응답 이후 사용자가 재생성을 요청할 수 있는 횟수 제한 여부 |
+| 2 | **(리뷰 중 갱신)** PDF 텍스트 추출(`_extract_pdf_text`/`_is_pdf`, PDF 검증·크기 제한)을 `funding.py`와 이 기능이 각각 구현할지, `app/domain/pdf_utils.py` 같은 공유 모듈로 뽑을지 — funding 담당과 협의 필요 |
+| 3 | `extract_funding_profile`(funding_match.py)이 리포트에서 이미 `category_1`/`category_2`/`service_type`/`target`/`region`/`stage`를 추출하고 있음 — 이 결과를 제안서 `field_values`의 일부(예: `target_market_analysis`, `company_overview`) 초기값으로 재사용해 사용자 입력 부담을 줄일 수 있는지 검토 |
+| 4 | **(구현 완료, 2026-09-07)** LLM 프롬프트 설계 — `app/domain/proposal_llm.py`. 유형 하나당 호출 1번으로 묶어 TEXT/TABLE 필드를 한꺼번에 생성(`correction_llm.py`와 동일한 json_schema strict + Redis 캐싱 컨벤션) |
+| 5 | **(구현 완료, 2026-09-07)** 실제 PDF 바이너리 생성 — `app/domain/proposal_pdf.py`(reportlab + 나눔고딕 임베딩). §6-1(동기 생성 vs presigned URL)은 동기 생성으로 확정 — 문서 분량이 크지 않아 presigned URL 인프라(S3 등)를 새로 둘 필요가 없다고 판단 |
+| 6 | `ATTACHMENT_CHECKLISTS`(유형별 첨부서류 고정 목록, `app/domain/proposal_llm.py`)는 통상적으로 공통 요구되는 항목 기준의 초안이다 — 배포 전 실제 공고문으로 재대조 필요 |
+| 7 | 프론트 실제 연동 — 지금까지는 백엔드 단독 구현/테스트만 진행함 |
