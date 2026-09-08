@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import UploadFile
+from pypdf import PdfReader
 from starlette.datastructures import Headers
 
 from app.api import proposals
@@ -55,6 +56,25 @@ def _patched_client(response_content: str):
     mock_client = MagicMock()
     mock_client.chat.completions.create = AsyncMock(return_value=_fake_openai_response(response_content))
     return patch("app.domain.proposal_llm.AsyncOpenAI", return_value=mock_client)
+
+
+def _font_is_embedded(pdf_bytes: bytes, font_base_name: str) -> bool:
+    """PDF를 이미지로 렌더링해서 눈으로 확인하는 대신, 폰트가 실제로 파일 안에 박혀
+    있는지(/FontFile2)를 구조적으로 확인한다 -- 한 번은 실제로 이미지를 렌더링해서
+    CID 폰트 버전이 한글을 빈 칸으로 그리는 것을 직접 확인했고(app/domain/proposal_pdf.py
+    docstring 참고), 그 회귀를 이후로도 값싸게 계속 잡기 위한 자동 검사다.
+    """
+    reader = PdfReader(BytesIO(pdf_bytes))
+    for page in reader.pages:
+        fonts = (page.get("/Resources") or {}).get("/Font") or {}
+        for font_ref in fonts.values():
+            font_obj = font_ref.get_object()
+            if font_base_name not in str(font_obj.get("/BaseFont", "")):
+                continue
+            descriptor = font_obj.get("/FontDescriptor")
+            if descriptor is not None and "/FontFile2" in descriptor.get_object():
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +294,18 @@ def test_render_proposal_pdf_produces_valid_pdf_bytes() -> None:
     )
     assert pdf_bytes[:4] == b"%PDF"
     assert len(pdf_bytes) > 0
+
+
+def test_render_proposal_pdf_embeds_korean_font_not_just_referenced() -> None:
+    # 회귀 테스트: PDF 표준 CID 폰트(HYGothic-Medium 등)로 처음 구현했을 때 실제로
+    # 렌더링해보면 한글 폰트가 없는 뷰어에서 한글이 빈 칸으로 나오는 걸 확인했다
+    # (CID 폰트는 폰트 파일 없이 이름만 참조한다). NanumGothic을 /FontFile2로
+    # 실제 임베딩해야 어떤 뷰어에서도 항상 동일하게 보인다.
+    pdf_bytes = render_proposal_pdf(
+        "PSST",
+        [{"field_key": "company_overview", "label": "기업개요·대표자", "field_type": "TEXT", "value": "한글 테스트"}],
+    )
+    assert _font_is_embedded(pdf_bytes, "NanumGothic")
 
 
 def test_render_proposal_pdf_handles_empty_values_without_raising() -> None:
